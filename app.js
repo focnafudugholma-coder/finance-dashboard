@@ -1,15 +1,20 @@
 // Finance Dashboard - plain JavaScript, no libraries.
-// Data is saved in the browser with localStorage.
+// Two modes:
+//   "api"   -> data is stored by the Finance API (SQLite database)
+//   "local" -> data is stored in this browser with localStorage
 
 const STORAGE_KEY = "finance-dashboard-v1";
+const API_URL = "http://localhost:3000";
 const CATEGORIES = ["Salary", "Housing", "Food", "Transport", "Health", "Education", "Entertainment", "Savings", "Other"];
 const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
 
 const $ = (id) => document.getElementById(id);
-let transactions = loadData();
+let mode = "local";
+let localTransactions = loadLocal();
+let lastList = []; // transactions currently on screen (used by the CSV export)
 
-// ---------- storage ----------
-function loadData() {
+// ---------- local storage ----------
+function loadLocal() {
   try {
     const data = JSON.parse(localStorage.getItem(STORAGE_KEY));
     return Array.isArray(data) ? data : [];
@@ -18,11 +23,36 @@ function loadData() {
   }
 }
 
-function saveData() {
+function saveLocal() {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(transactions));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(localTransactions));
   } catch (e) {
     showError("Could not save data in this browser.");
+  }
+}
+
+// ---------- API ----------
+async function api(path, options) {
+  const res = await fetch(API_URL + path, options);
+  if (res.status === 204) return null;
+  const data = await res.json();
+  if (!res.ok) throw new Error((data.errors || [data.error]).join(", "));
+  return data;
+}
+
+// Uses the API only when this page is opened on the same computer (localhost or a file)
+// and the API answers. Otherwise it falls back to local mode.
+async function detectMode() {
+  const isLocalPage = ["localhost", "127.0.0.1", ""].includes(location.hostname);
+  if (!isLocalPage) return "local";
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1500);
+    const res = await fetch(API_URL + "/api/health", { signal: controller.signal });
+    clearTimeout(timer);
+    return res.ok ? "api" : "local";
+  } catch (e) {
+    return "local";
   }
 }
 
@@ -36,16 +66,48 @@ function showError(message) {
   $("error").textContent = message;
 }
 
-function getVisible() {
-  const showAll = $("all").checked;
-  const month = $("month").value;
-  return transactions
-    .filter((t) => showAll || !month || t.date.slice(0, 7) === month)
+function currentMonth() {
+  return $("all").checked ? "" : $("month").value;
+}
+
+// Same calculation the API does, used in local mode.
+function summarize(list) {
+  let income = 0;
+  let expenses = 0;
+  const byCategory = {};
+  list.forEach((t) => {
+    if (t.type === "income") {
+      income += t.amount;
+    } else {
+      expenses += t.amount;
+      byCategory[t.category] = (byCategory[t.category] || 0) + t.amount;
+    }
+  });
+  return {
+    income,
+    expenses,
+    balance: Math.round((income - expenses) * 100) / 100,
+    expensesByCategory: Object.entries(byCategory)
+      .map(([category, total]) => ({ category, total }))
+      .sort((a, b) => b.total - a.total),
+  };
+}
+
+async function getData() {
+  const month = currentMonth();
+  if (mode === "api") {
+    const query = month ? "?month=" + month : "";
+    const [list, summary] = await Promise.all([api("/api/transactions" + query), api("/api/summary" + query)]);
+    return { list, summary };
+  }
+  const list = localTransactions
+    .filter((t) => !month || t.date.slice(0, 7) === month)
     .sort((a, b) => b.date.localeCompare(a.date));
+  return { list, summary: summarize(list) };
 }
 
 // ---------- actions ----------
-function addTransaction() {
+async function addTransaction() {
   const description = $("description").value.trim();
   const amount = parseFloat($("amount").value);
   const date = $("date").value;
@@ -54,39 +116,60 @@ function addTransaction() {
   if (!(amount > 0)) return showError("Amount must be greater than zero.");
   if (!date) return showError("Please choose a date.");
 
-  transactions.push({
-    id: Date.now() + Math.random(),
+  const tx = {
     description,
     amount: Math.round(amount * 100) / 100,
     type: $("type").value,
     category: $("category").value,
     date,
-  });
-  saveData();
-  showError("");
-  $("description").value = "";
-  $("amount").value = "";
-  render();
+  };
+
+  try {
+    if (mode === "api") {
+      await api("/api/transactions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(tx),
+      });
+    } else {
+      localTransactions.push({ id: Date.now() + Math.random(), ...tx });
+      saveLocal();
+    }
+    showError("");
+    $("description").value = "";
+    $("amount").value = "";
+    await render();
+  } catch (e) {
+    showError(e.message);
+  }
 }
 
-function deleteTransaction(id) {
-  transactions = transactions.filter((t) => t.id !== id);
-  saveData();
-  render();
+async function deleteTransaction(id) {
+  try {
+    if (mode === "api") {
+      await api("/api/transactions/" + id, { method: "DELETE" });
+    } else {
+      localTransactions = localTransactions.filter((t) => t.id !== id);
+      saveLocal();
+    }
+    await render();
+  } catch (e) {
+    showError(e.message);
+  }
 }
 
 function clearAll() {
-  if (transactions.length === 0) return;
-  if (confirm("Delete ALL transactions? This cannot be undone.")) {
-    transactions = [];
-    saveData();
+  if (localTransactions.length === 0) return;
+  if (confirm("Delete ALL transactions saved in this browser? This cannot be undone.")) {
+    localTransactions = [];
+    saveLocal();
     render();
   }
 }
 
 function exportCsv() {
   const rows = [["Date", "Description", "Category", "Type", "Amount"]];
-  getVisible().forEach((t) => rows.push([t.date, t.description, t.category, t.type, t.amount.toFixed(2)]));
+  lastList.forEach((t) => rows.push([t.date, t.description, t.category, t.type, t.amount.toFixed(2)]));
   const csv = rows.map((r) => r.map((v) => '"' + String(v).replace(/"/g, '""') + '"').join(",")).join("\n");
   const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
   const link = document.createElement("a");
@@ -97,30 +180,31 @@ function exportCsv() {
 }
 
 // ---------- rendering ----------
-function render() {
-  const visible = getVisible();
+async function render() {
+  try {
+    const { list, summary } = await getData();
+    lastList = list;
 
-  const income = visible.filter((t) => t.type === "income").reduce((s, t) => s + t.amount, 0);
-  const expenses = visible.filter((t) => t.type === "expense").reduce((s, t) => s + t.amount, 0);
-  $("income").textContent = money.format(income);
-  $("expenses").textContent = money.format(expenses);
-  const balance = income - expenses;
-  $("balance").textContent = money.format(balance);
-  $("balance").className = balance < 0 ? "negative" : "positive";
+    $("income").textContent = money.format(summary.income);
+    $("expenses").textContent = money.format(summary.expenses);
+    $("balance").textContent = money.format(summary.balance);
+    $("balance").className = summary.balance < 0 ? "negative" : "positive";
 
-  renderList(visible);
-  renderChart(visible);
+    renderList(list);
+    renderChart(summary.expensesByCategory);
+  } catch (e) {
+    showError("Could not load data: " + e.message);
+  }
 }
 
-function renderList(visible) {
+function renderList(list) {
   const tbody = $("list");
   tbody.textContent = "";
-  $("empty").style.display = visible.length ? "none" : "block";
+  $("empty").style.display = list.length ? "none" : "block";
 
-  visible.forEach((t) => {
+  list.forEach((t) => {
     const tr = document.createElement("tr");
-    const cells = [t.date, t.description, t.category];
-    cells.forEach((text) => {
+    [t.date, t.description, t.category].forEach((text) => {
       const td = document.createElement("td");
       td.textContent = text; // textContent keeps user text safe from HTML injection
       tr.appendChild(td);
@@ -145,20 +229,14 @@ function renderList(visible) {
   });
 }
 
-function renderChart(visible) {
+function renderChart(entries) {
   const chart = $("chart");
   chart.textContent = "";
-
-  const totals = {};
-  visible.filter((t) => t.type === "expense").forEach((t) => {
-    totals[t.category] = (totals[t.category] || 0) + t.amount;
-  });
-  const entries = Object.entries(totals).sort((a, b) => b[1] - a[1]);
   $("chart-empty").style.display = entries.length ? "none" : "block";
   if (!entries.length) return;
 
-  const max = entries[0][1];
-  entries.forEach(([category, total]) => {
+  const max = entries[0].total;
+  entries.forEach(({ category, total }) => {
     const row = document.createElement("div");
     row.className = "bar-row";
 
@@ -182,7 +260,7 @@ function renderChart(visible) {
 }
 
 // ---------- start ----------
-function init() {
+async function init() {
   CATEGORIES.forEach((c) => {
     const option = document.createElement("option");
     option.value = c;
@@ -199,7 +277,15 @@ function init() {
   $("all").addEventListener("change", render);
   $("export").addEventListener("click", exportCsv);
   $("clear").addEventListener("click", clearAll);
-  render();
+
+  mode = await detectMode();
+  if (mode === "api") {
+    $("mode").textContent = "Connected to the Finance API. Data is saved in the database.";
+    $("clear").style.display = "none"; // "Clear all" only applies to browser data
+  } else {
+    $("mode").textContent = "Local mode. Data is saved in this browser.";
+  }
+  await render();
 }
 
 init();
